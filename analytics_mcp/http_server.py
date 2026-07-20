@@ -107,6 +107,9 @@ def build_app() -> Starlette:
 
     return Starlette(
         routes=[
+            # Both "/" and "/healthz" answer 200 so platform health probes pass
+            # regardless of which path they hit.
+            Route("/", endpoint=healthz, methods=["GET"]),
             Route("/healthz", endpoint=healthz, methods=["GET"]),
             Mount("/mcp", app=handle_mcp),
         ],
