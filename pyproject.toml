@@ -14,6 +14,7 @@ dependencies = [
     "mcp>=1.24.0",
     "google-adk>=1.29.0",
     "httpx>=0.28.1",
+    "uvicorn[standard]>=0.31.1",
 ]
 keywords = ["google analytics", "analytics", "mcp", "ga4"]
 classifiers = [
@@ -44,6 +45,8 @@ issues = "https://github.com/googleanalytics/google-analytics-mcp/issues"
 analytics-mcp = "analytics_mcp.server:run_server"
 # The previous name of the script. Kept for backwards compatibility.
 google-analytics-mcp = "analytics_mcp.server:run_server"
+# Streamable-HTTP entry point for remote deployment (Claude connectors).
+analytics-mcp-http = "analytics_mcp.http_server:main"
 
 [project.optional-dependencies]
 dev = ["black", "nox >=2026.2.9, <2027"]
