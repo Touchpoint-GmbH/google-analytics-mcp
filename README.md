@@ -73,97 +73,63 @@ to enable the following APIs in your Google Cloud project:
 
 ### Configure credentials 🔑
 
-Configure your [Application Default Credentials
-(ADC)](https://cloud.google.com/docs/authentication/provide-credentials-adc).
-Make sure the credentials are for a user with access to your Google Analytics
-accounts or properties.
+This fork authenticates each user with their **personal Google account** via
+OAuth 2.0. It runs as a remote streamable-HTTP server; the MCP connector walks
+the user through Google's consent screen, and every tool call runs with that
+user's Google Analytics permissions. The account must already have access to
+the GA4 properties it should read.
 
-Credentials must include the Google Analytics read-only scope:
+1.  In your Google Cloud project, create an **OAuth 2.0 Client ID** of type
+    *Web application* (APIs & Services > Credentials). See
+    [Manage OAuth Clients](https://support.google.com/cloud/answer/15549257).
 
-```
-https://www.googleapis.com/auth/analytics.readonly
-```
+1.  Add the following **Authorized redirect URI**, where `BASE_URL` is the
+    public HTTPS URL of your deployment:
 
-Check out
-[Manage OAuth Clients](https://support.google.com/cloud/answer/15549257)
-for how to create an OAuth client.
-
-Here are some sample `gcloud` commands you might find useful:
-
-- Set up ADC using user credentials and an OAuth desktop or web client after
-  downloading the client JSON to `YOUR_CLIENT_JSON_FILE`.
-
-  ```shell
-  gcloud auth application-default login \
-    --scopes https://www.googleapis.com/auth/analytics.readonly,https://www.googleapis.com/auth/cloud-platform \
-    --client-id-file=YOUR_CLIENT_JSON_FILE
-  ```
-
-- Set up ADC using service account impersonation.
-
-  ```shell
-  gcloud auth application-default login \
-    --impersonate-service-account=SERVICE_ACCOUNT_EMAIL \
-    --scopes=https://www.googleapis.com/auth/analytics.readonly,https://www.googleapis.com/auth/cloud-platform
-  ```
-
-When the `gcloud auth application-default` command completes, copy the
-`PATH_TO_CREDENTIALS_JSON` file location printed to the console in the
-following message. You'll need this for the next step!
-
-```
-Credentials saved to file: [PATH_TO_CREDENTIALS_JSON]
-```
-
-### Configure Gemini
-
-1.  Install [Gemini
-    CLI](https://github.com/google-gemini/gemini-cli/blob/main/docs/get-started/installation.md)
-    or [Gemini Code
-    Assist](https://marketplace.visualstudio.com/items?itemName=Google.geminicodeassist).
-
-1.  Create or edit the file at `~/.gemini/settings.json`, adding your server
-    to the `mcpServers` list.
-
-    Replace `PATH_TO_CREDENTIALS_JSON` with the path you copied in the previous
-    step.
-
-    We also recommend that you add a `GOOGLE_CLOUD_PROJECT` attribute to the
-    `env` object. Replace `YOUR_PROJECT_ID` in the following example with the
-    [project ID](https://support.google.com/googleapi/answer/7014113) of your
-    Google Cloud project.
-
-    ```json
-    {
-      "mcpServers": {
-        "analytics-mcp": {
-          "command": "pipx",
-          "args": ["run", "analytics-mcp"],
-          "env": {
-            "GOOGLE_APPLICATION_CREDENTIALS": "PATH_TO_CREDENTIALS_JSON",
-            "GOOGLE_PROJECT_ID": "YOUR_PROJECT_ID"
-          }
-        }
-      }
-    }
+    ```
+    <BASE_URL>/auth/callback
     ```
 
-### Configure Claude Code
+1.  Configure the server via environment variables (see
+    [`.env.example`](./.env.example)):
 
-1.  Add the MCP server with the following command:
+    | Variable | Description |
+    | --- | --- |
+    | `ANALYTICS_MCP_OAUTH_CLIENT_ID` | OAuth 2.0 client ID |
+    | `ANALYTICS_MCP_OAUTH_CLIENT_SECRET` | OAuth 2.0 client secret |
+    | `ANALYTICS_MCP_BASE_URL` | Public HTTPS base URL, e.g. `https://ga4-mcp.example.com` |
 
-    Replace `PATH_TO_CREDENTIALS_JSON` with the path you copied in the previous
-    step, and replace `YOUR_PROJECT_ID` with the
-    [project ID](https://support.google.com/googleapi/answer/7014113) of your
-    Google Cloud project.
+    The requested scopes are `openid`, `userinfo.email`, `userinfo.profile`,
+    and `https://www.googleapis.com/auth/analytics.readonly`.
 
-    ```shell
-    claude mcp add analytics-mcp \
-      --scope user \
-      -e "GOOGLE_APPLICATION_CREDENTIALS=PATH_TO_CREDENTIALS_JSON" \
-      -e "GOOGLE_PROJECT_ID=YOUR_PROJECT_ID" \
-      -- pipx run analytics-mcp
-    ```
+When both OAuth client variables are set, `analytics-mcp` serves streamable
+HTTP at `/mcp`. With them unset it falls back to stdio (for local development),
+but tool calls then have no user token and will fail — OAuth is the supported
+path for this fork.
+
+### Deploy with Docker 🐳
+
+```shell
+docker build -t analytics-mcp .
+docker run -p 8000:8000 --env-file .env analytics-mcp
+```
+
+### Connect an MCP client
+
+Point your client at the deployed endpoint and let it run the OAuth flow:
+
+```
+https://ga4-mcp.example.com/mcp
+```
+
+For example, in Claude Code:
+
+```shell
+claude mcp add analytics-mcp \
+  --scope user \
+  --transport http \
+  https://ga4-mcp.example.com/mcp
+```
 
 ## Try it out 🥼
 

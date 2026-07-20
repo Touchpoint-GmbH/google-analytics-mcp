@@ -15,19 +15,17 @@
 """Module declaring the singleton MCP server.
 
 The singleton allows other modules to register their tools with the same MCP
-server.
+server. When OAuth client credentials are provided, the server authenticates
+each user with their personal Google account via FastMCP's OAuth proxy
+(``GoogleProvider``); every tool call then runs with that user's access token
+(see ``analytics_mcp.tools.client``). Without OAuth credentials the server still
+starts, but tool calls fail because no access token is available.
 """
 
-# MCP Server Imports
-import json
-import sys
-from json import tool
-from mcp import types as mcp_types  # Use alias to avoid conflict
-from mcp.server.lowlevel import Server
+import os
 
-# ADK Tool Imports
-from google.adk.tools.function_tool import FunctionTool
-from google.adk.tools.mcp_tool.conversion_utils import adk_to_mcp_tool_type
+from fastmcp import FastMCP
+from fastmcp.server.auth.providers.google import GoogleProvider
 
 from analytics_mcp.tools.admin.info import (
     get_account_summaries,
@@ -55,134 +53,54 @@ from analytics_mcp.tools.reporting.conversions import (
     _run_conversions_report_description,
 )
 
-run_report_with_description = FunctionTool(run_report)
-run_report_with_description.description = _run_report_description()
-run_realtime_report_with_description = FunctionTool(run_realtime_report)
-run_realtime_report_with_description.description = (
-    _run_realtime_report_description()
-)
-run_funnel_report_with_description = FunctionTool(run_funnel_report)
-run_funnel_report_with_description.description = (
-    _run_funnel_report_description()
-)
-run_conversions_report_with_description = FunctionTool(run_conversions_report)
-run_conversions_report_with_description.description = (
-    _run_conversions_report_description()
-)
+_CLIENT_ID = os.environ.get("ANALYTICS_MCP_OAUTH_CLIENT_ID")
+_CLIENT_SECRET = os.environ.get("ANALYTICS_MCP_OAUTH_CLIENT_SECRET")
+_BASE_URL = os.environ.get("ANALYTICS_MCP_BASE_URL", "http://localhost:8000")
 
-# Instantiate the ADK tools
-tools = [
-    FunctionTool(get_account_summaries),
-    FunctionTool(list_google_ads_links),
-    FunctionTool(get_property_details),
-    FunctionTool(list_property_annotations),
-    FunctionTool(get_custom_dimensions_and_metrics),
-    run_report_with_description,
-    run_realtime_report_with_description,
-    run_funnel_report_with_description,
-    run_conversions_report_with_description,
+# Scopes requested during the OAuth consent flow. ``analytics.readonly`` grants
+# read access to the Admin and Data APIs; the identity scopes let the OAuth
+# proxy resolve the signed-in user.
+_REQUIRED_SCOPES = [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/analytics.readonly",
 ]
 
-tool_map = {t.name: t for t in tools}
 
-app = Server(
-    name="Google Analytics MCP Server",
+def _build_mcp() -> FastMCP:
+    """Builds the FastMCP server, enabling OAuth when client creds are set."""
+    if _CLIENT_ID and _CLIENT_SECRET:
+        auth = GoogleProvider(
+            client_id=_CLIENT_ID,
+            client_secret=_CLIENT_SECRET,
+            base_url=_BASE_URL,
+            required_scopes=_REQUIRED_SCOPES,
+        )
+        return FastMCP("Google Analytics MCP Server", auth=auth)
+    return FastMCP("Google Analytics MCP Server")
+
+
+app = _build_mcp()
+
+# Tools without custom descriptions rely on their docstrings for the schema.
+for _tool in (
+    get_account_summaries,
+    list_google_ads_links,
+    get_property_details,
+    list_property_annotations,
+    get_custom_dimensions_and_metrics,
+):
+    app.tool(_tool)
+
+# Reporting tools carry generated descriptions with argument hints that are too
+# large to keep inline as docstrings.
+app.tool(run_report, description=_run_report_description())
+app.tool(
+    run_realtime_report, description=_run_realtime_report_description()
 )
-
-mcp_tools = [adk_to_mcp_tool_type(tool) for tool in tools]
-
-
-def sanitize_mcp_schema_properties(node: dict) -> None:
-    """Ensure additionalProperties is a boolean value to satisfy certain MCP clients.
-
-    This addresses issues with clients like Claude Desktop that fail when
-    additionalProperties is a schema object instead of a boolean.
-    """
-    if not isinstance(node, dict):
-        return
-
-    # Check and update the current node
-    if "additionalProperties" in node:
-        val = node["additionalProperties"]
-        if not isinstance(val, bool):
-            node["additionalProperties"] = True
-
-    # Traverse children
-    for key, child in node.items():
-        if isinstance(child, dict):
-            sanitize_mcp_schema_properties(child)
-        elif isinstance(child, list):
-            for element in child:
-                if isinstance(element, dict):
-                    sanitize_mcp_schema_properties(element)
-
-
-# Update the inputSchema for tools that do not have parameters.
-# TODO: This is a bug in the ADK and can be removed once it is fixed.
-# https://github.com/google/adk-python/issues/948
-for tool in mcp_tools:
-    # Check if inputSchema is empty
-    if tool.inputSchema == {}:
-        tool.inputSchema = {"type": "object", "properties": {}}
-    # Fix union type hints generating spurious "type": "null"
-    for prop in tool.inputSchema.get("properties", {}).values():
-        if "anyOf" in prop and prop.get("type") == "null":
-            del prop["type"]
-
-    # Ensure additionalProperties is compatible with all MCP clients
-    sanitize_mcp_schema_properties(tool.inputSchema)
-
-    # Explicitly mark required fields for reporting tools to guide the LLM
-    if tool.name == "run_report":
-        tool.inputSchema["required"] = [
-            "property_id",
-            "date_ranges",
-            "dimensions",
-            "metrics",
-        ]
-    elif tool.name == "run_realtime_report":
-        tool.inputSchema["required"] = ["property_id", "dimensions", "metrics"]
-    elif tool.name == "run_conversions_report":
-        tool.inputSchema["required"] = [
-            "property_id",
-            "date_ranges",
-            "dimensions",
-            "metrics",
-            "conversion_spec",
-        ]
-
-
-@app.list_tools()
-async def list_tools() -> list[mcp_types.Tool]:
-    return mcp_tools
-
-
-@app.call_tool()
-async def call_mcp_tool(name: str, arguments: dict) -> list[mcp_types.Content]:
-    if name in tool_map:
-        tool = tool_map[name]
-        try:
-            adk_tool_response = await tool.run_async(
-                args=arguments,
-                tool_context=None,
-            )
-            # Serialize the ADK tool response to JSON for MCP response
-            response_text = json.dumps(adk_tool_response, indent=2)
-            # MCP expects a list of mcp_types.Content parts
-            return [mcp_types.TextContent(type="text", text=response_text)]
-
-        except Exception as e:
-            print(
-                f"MCP Server: Error executing ADK tool '{name}': {e}",
-                file=sys.stderr,
-            )
-            # Return an error message in MCP format
-            error_text = json.dumps(
-                {"error": f"Failed to execute tool '{name}': {str(e)}"}
-            )
-            return [mcp_types.TextContent(type="text", text=error_text)]
-
-    error_text = json.dumps(
-        {"error": f"Tool '{name}' not implemented by this server."}
-    )
-    return [mcp_types.TextContent(type="text", text=error_text)]
+app.tool(run_funnel_report, description=_run_funnel_report_description())
+app.tool(
+    run_conversions_report,
+    description=_run_conversions_report_description(),
+)

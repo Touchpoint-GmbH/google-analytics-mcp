@@ -14,51 +14,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Entry point for the Google Analytics MCP server."""
+"""Entry point for the Google Analytics MCP server.
 
-import asyncio
-import sys
-import analytics_mcp.coordinator as coordinator
-from mcp.server.lowlevel import NotificationOptions
-from mcp.server.models import InitializationOptions
-import mcp.server.stdio
-import mcp.server
-import traceback
+Runs over streamable HTTP when OAuth client credentials are configured (the
+per-user login flow); otherwise falls back to stdio for local development.
+"""
+
+import os
+
+from analytics_mcp.coordinator import app
 
 
-async def run_server_async():
-    """Runs the MCP server over standard I/O."""
-    print("Starting MCP Stdio Server:", coordinator.app.name, file=sys.stderr)
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await coordinator.app.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name=coordinator.app.name,  # Use the server name defined above
-                server_version="1.0.0",
-                capabilities=coordinator.app.get_capabilities(
-                    # Define server capabilities - consult MCP docs for options
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
+def run_server() -> None:
+    """Runs the MCP server, choosing transport based on OAuth configuration."""
+    client_id = os.environ.get("ANALYTICS_MCP_OAUTH_CLIENT_ID")
+    client_secret = os.environ.get("ANALYTICS_MCP_OAUTH_CLIENT_SECRET")
+
+    if client_id and client_secret:
+        app.run(
+            transport="streamable-http",
+            host=os.environ.get("HOST", "0.0.0.0"),
+            port=int(os.environ.get("PORT", "8000")),
         )
-
-
-def run_server():
-    """Synchronous wrapper to run the async MCP server."""
-    asyncio.run(run_server_async())
+    else:
+        app.run()
 
 
 if __name__ == "__main__":
-    try:
-        run_server()
-    except KeyboardInterrupt:
-        print("\nMCP Server (stdio) stopped by user.", file=sys.stderr)
-    except Exception:
-        import traceback
-
-        print("MCP Server (stdio) encountered an error:", file=sys.stderr)
-        traceback.print_exc()
-    finally:
-        print("MCP Server (stdio) process exiting.", file=sys.stderr)
+    run_server()

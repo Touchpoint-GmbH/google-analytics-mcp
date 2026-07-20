@@ -4,9 +4,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install the package plus the HTTP server runtime dependencies.
+# Install the package (FastMCP bundles the HTTP server runtime).
 COPY . /app
-RUN pip install --no-cache-dir . "uvicorn[standard]"
+RUN pip install --no-cache-dir .
 
 # Run as a non-root user.
 RUN useradd -m app && chown -R app /app
@@ -17,4 +17,5 @@ ENV HOST=0.0.0.0 \
 
 EXPOSE 8000
 
-CMD ["python", "-m", "analytics_mcp.http_server"]
+# Serves streamable HTTP when the OAuth client env vars are set (see .env.example).
+CMD ["analytics-mcp"]

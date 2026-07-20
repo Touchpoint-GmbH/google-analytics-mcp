@@ -12,15 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Client initialization for the Google Analytics APIs."""
+"""Client initialization for the Google Analytics APIs.
 
-import contextlib
-import subprocess
+Credentials are resolved per request from the access token that FastMCP's OAuth
+proxy obtained for the signed-in user. Because every request may belong to a
+different user, credentials are intentionally *not* cached across calls.
+"""
+
 import threading
 from importlib import metadata
-from unittest.mock import patch
 
-import google.auth
+from fastmcp.server.dependencies import get_access_token
+from google.oauth2.credentials import Credentials
 from google.analytics import (
     admin_v1beta,
     data_v1beta,
@@ -46,44 +49,26 @@ _CLIENT_INFO = ClientInfo(
     user_agent=f"analytics-mcp/{_get_package_version_with_fallback()}"
 )
 
-# Read-only scope for Analytics Admin API and Analytics Data API.
-_READ_ONLY_ANALYTICS_SCOPE = (
-    "https://www.googleapis.com/auth/analytics.readonly"
-)
-
-# Lock to ensure client and credential creation is thread-safe
+# Lock to ensure client creation is thread-safe.
 _client_lock = threading.Lock()
-_CREDENTIALS = None
 
 
-@contextlib.contextmanager
-def prevent_stdio_inheritance():
-    """Prevents child processes from inheriting the parent's stdio handles.
+def _get_credentials() -> Credentials:
+    """Returns credentials built from the current user's OAuth access token.
 
-    Fixes a deadlock on Windows where `google.auth.default()` spawns `gcloud`
-    via subprocess without redirecting stdin, causing it to inherit the
-    ProactorEventLoop's overlapping I/O handles used by MCP's stdio transport.
+    The token is provided by FastMCP's OAuth proxy for the request in flight, so
+    API calls run with the signed-in user's Google Analytics permissions. The
+    user must have been granted access to the relevant GA4 properties.
     """
-    original_popen = subprocess.Popen
-
-    def safe_popen(*args, **kwargs):
-        if kwargs.get("stdin") is None:
-            kwargs["stdin"] = subprocess.DEVNULL
-        return original_popen(*args, **kwargs)
-
-    with patch("subprocess.Popen", new=safe_popen):
-        yield
-
-
-def _get_credentials():
-    global _CREDENTIALS
-    # Expected to be called under _client_lock
-    if _CREDENTIALS is None:
-        with prevent_stdio_inheritance():
-            _CREDENTIALS, _ = google.auth.default(
-                scopes=[_READ_ONLY_ANALYTICS_SCOPE]
-            )
-    return _CREDENTIALS
+    token = get_access_token()
+    if token is None or not token.token:
+        raise RuntimeError(
+            "No OAuth access token in the request context. This server "
+            "requires per-user authentication via the OAuth proxy; set "
+            "ANALYTICS_MCP_OAUTH_CLIENT_ID and ANALYTICS_MCP_OAUTH_CLIENT_SECRET "
+            "and connect over streamable HTTP."
+        )
+    return Credentials(token=token.token)
 
 
 def create_admin_api_client() -> admin_v1beta.AnalyticsAdminServiceClient:
