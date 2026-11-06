@@ -14,37 +14,289 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Entry point for the Google Analytics MCP server.
+"""Entry point for the Google Analytics MCP server."""
 
-Runs over streamable HTTP when OAuth client credentials are configured (the
-per-user login flow); otherwise falls back to stdio for local development.
-"""
-
+import argparse
+import asyncio
 import logging
 import os
+import sys
+import traceback
+from typing import Sequence
+from urllib.parse import urlparse
 
-from analytics_mcp.coordinator import app
+import analytics_mcp.coordinator as coordinator
+from analytics_mcp.oauth import build_oauth_components
+from analytics_mcp.usage_log import (
+    IdentityScopedGoogleOAuthProvider,
+    ToolCallRecorder,
+)
+import mcp.server
+from mcp.server.lowlevel import NotificationOptions
+from mcp.server.models import InitializationOptions
+import mcp.server.stdio
+from mcp.server.transport_security import TransportSecuritySettings
+import uvicorn
 
-_LOGGERS_THAT_PRINT_ACCESS_TOKENS = ("httpx", "httpx2")
+logger = logging.getLogger(__name__)
+
+_TRUTHY_ENV_VALUES = ("1", "true", "yes", "on")
+_FALSY_ENV_VALUES = ("0", "false", "no", "off")
+# httpx logs every request URL at INFO level; keep token-bearing calls to
+# Google out of the logs.
+_LOGGERS_THAT_PRINT_ACCESS_TOKENS = ("httpx", "httpcore")
 
 
-def run_server() -> None:
-    """Runs the MCP server, choosing transport based on OAuth configuration."""
+def _env_flag(name: str) -> bool:
+    """Resolves a boolean environment variable, defaulting to False."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return False
+    lowered = raw.lower()
+    if lowered in _TRUTHY_ENV_VALUES:
+        return True
+    if lowered in _FALSY_ENV_VALUES:
+        return False
+    logger.warning(
+        "Invalid boolean environment variable %s=%r; falling back to False.",
+        name,
+        raw,
+    )
+    return False
+
+
+def _default_port_from_env() -> int:
+    """Resolves a valid numeric PORT env var, falling back to 8000."""
+    raw_port = (os.environ.get("PORT") or "").strip()
+    if raw_port:
+        try:
+            parsed = int(raw_port)
+            if 1 <= parsed <= 65535:
+                return parsed
+        except ValueError:
+            pass
+        logger.warning(
+            "Invalid PORT environment variable %r; falling back to default "
+            "port 8000.",
+            raw_port,
+        )
+    return 8000
+
+
+def _format_url_host(host: str) -> str:
+    """Wraps bare IPv6 host literals in brackets for URL construction."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parses command-line arguments for the MCP server."""
+    parser = argparse.ArgumentParser(
+        description="Google Analytics MCP Server",
+    )
+    parser.add_argument(
+        "--allow-write",
+        action="store_true",
+        default=_env_flag("ANALYTICS_MCP_ALLOW_WRITE"),
+        help=(
+            "Enable tools that create or modify Google Analytics resources. "
+            "Requires the https://www.googleapis.com/auth/analytics.edit "
+            "scope. Defaults to ANALYTICS_MCP_ALLOW_WRITE."
+        ),
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default="stdio",
+        help=(
+            "Transport protocol to use: 'stdio' (default, uses local ADC) or "
+            "'http' (Streamable HTTP for multi-tenant deployments, requires "
+            "per-request OAuth Bearer tokens)."
+        ),
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host interface to bind when --transport=http (default: 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=(
+            "Port to bind when --transport=http. Defaults to PORT (or 8000 "
+            "if unset)."
+        ),
+    )
+    parser.add_argument(
+        "--stateless-http",
+        action="store_true",
+        default=_env_flag("ANALYTICS_MCP_STATELESS_HTTP"),
+        help=(
+            "Handle each HTTP request independently without tracking in-memory "
+            "MCP sessions across requests when --transport=http. Enable this "
+            "for multi-tenant, load-balanced, or serverless deployments (such "
+            "as Cloud Run) where requests may scale to zero or route across "
+            "multiple instances. Defaults to ANALYTICS_MCP_STATELESS_HTTP."
+        ),
+    )
+    parser.add_argument(
+        "--oauth",
+        action="store_true",
+        default=_env_flag("ANALYTICS_MCP_OAUTH"),
+        help=(
+            "Enable the built-in MCP OAuth 2.1 Authorization Server proxying "
+            "Google OAuth 2.0 when --transport=http. Requires "
+            "GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET. Defaults "
+            "to ANALYTICS_MCP_OAUTH."
+        ),
+    )
+    parser.add_argument(
+        "--usage-log",
+        action="store_true",
+        default=_env_flag("ANALYTICS_MCP_USAGE_LOG"),
+        help=(
+            "Record every tool call to the mcp_usage Postgres database "
+            "(MCP_USAGE_DSN) when --transport=http. Defaults to "
+            "ANALYTICS_MCP_USAGE_LOG."
+        ),
+    )
+    parser.add_argument(
+        "--issuer-url",
+        default=None,
+        help=(
+            "Public issuer base URL when --oauth is enabled. Defaults to "
+            "ANALYTICS_MCP_ISSUER_URL (or http://<host>:<port> if unset)."
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.port is None:
+        args.port = _default_port_from_env()
+    return args
+
+
+def build_http_app(args: argparse.Namespace):
+    """Builds the Starlette ASGI app for multi-tenant Streamable HTTP mode."""
+    recorder = (
+        ToolCallRecorder.from_env(server="google-analytics")
+        if args.usage_log
+        else None
+    )
+    app = coordinator.create_server(
+        allow_write=args.allow_write,
+        require_request_credentials=True,
+        recorder=recorder,
+    )
+
+    auth_settings = None
+    token_verifier = None
+    oauth_provider = None
+    custom_routes = None
+    transport_security = None
+
+    explicit_issuer_url = (
+        args.issuer_url or os.environ.get("ANALYTICS_MCP_ISSUER_URL") or ""
+    ).strip()
+
+    if args.oauth:
+        client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "").strip()
+        client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "").strip()
+        if not client_id or not client_secret:
+            raise ValueError(
+                "--oauth requires GOOGLE_OAUTH_CLIENT_ID and "
+                "GOOGLE_OAUTH_CLIENT_SECRET environment variables to be set."
+            )
+        default_host = (
+            "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
+        )
+        url_host = _format_url_host(default_host)
+        issuer_url = explicit_issuer_url or f"http://{url_host}:{args.port}"
+        oauth_provider = IdentityScopedGoogleOAuthProvider(
+            google_client_id=client_id,
+            google_client_secret=client_secret,
+            issuer_url=issuer_url,
+            allow_write=args.allow_write,
+        )
+        auth_settings, token_verifier, custom_routes = build_oauth_components(
+            oauth_provider
+        )
+
+    if explicit_issuer_url and args.host in ("127.0.0.1", "localhost", "::1"):
+        parsed_issuer = urlparse(explicit_issuer_url)
+        if parsed_issuer.netloc:
+            transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+                allowed_hosts=[
+                    "127.0.0.1:*",
+                    "localhost:*",
+                    "[::1]:*",
+                    parsed_issuer.netloc,
+                ],
+                allowed_origins=[
+                    "http://127.0.0.1:*",
+                    "http://localhost:*",
+                    "http://[::1]:*",
+                    f"{parsed_issuer.scheme}://{parsed_issuer.netloc}",
+                ],
+            )
+
+    return app.streamable_http_app(
+        host=args.host,
+        stateless_http=args.stateless_http,
+        transport_security=transport_security,
+        auth=auth_settings,
+        token_verifier=token_verifier,
+        auth_server_provider=oauth_provider,
+        custom_starlette_routes=custom_routes,
+    )
+
+
+async def run_server_async(allow_write: bool = False):
+    """Runs the MCP server over standard I/O."""
+    app = coordinator.create_server(allow_write=allow_write)
+    print("Starting MCP Stdio Server:", app.name, file=sys.stderr)
+    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+        await app.run(
+            read_stream,
+            write_stream,
+            InitializationOptions(
+                server_name=app.name,  # Use the server name defined above
+                server_version="1.1.0",
+                capabilities=app.get_capabilities(
+                    # Define server capabilities - consult MCP docs for options
+                    notification_options=NotificationOptions(),
+                    experimental_capabilities={},
+                ),
+            ),
+        )
+
+
+def run_server(argv: Sequence[str] | None = None):
+    """Synchronous wrapper to run the MCP server."""
+    args = parse_args(argv)
     for logger_name in _LOGGERS_THAT_PRINT_ACCESS_TOKENS:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
-
-    client_id = os.environ.get("ANALYTICS_MCP_OAUTH_CLIENT_ID")
-    client_secret = os.environ.get("ANALYTICS_MCP_OAUTH_CLIENT_SECRET")
-
-    if client_id and client_secret:
-        app.run(
-            transport="streamable-http",
-            host=os.environ.get("HOST", "0.0.0.0"),
-            port=int(os.environ.get("PORT", "8000")),
+    if args.transport == "http":
+        http_app = build_http_app(args)
+        url_host = _format_url_host(args.host)
+        print(
+            f"Starting MCP Streamable HTTP Server on "
+            f"http://{url_host}:{args.port}/mcp",
+            file=sys.stderr,
         )
+        uvicorn.run(http_app, host=args.host, port=args.port)
     else:
-        app.run()
+        asyncio.run(run_server_async(allow_write=args.allow_write))
 
 
 if __name__ == "__main__":
-    run_server()
+    try:
+        run_server()
+    except KeyboardInterrupt:
+        print("\nMCP Server stopped by user.", file=sys.stderr)
+    except Exception:
+        print("MCP Server encountered an error:", file=sys.stderr)
+        traceback.print_exc()
+    finally:
+        print("MCP Server process exiting.", file=sys.stderr)

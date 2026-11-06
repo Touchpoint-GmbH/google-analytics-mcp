@@ -1,4 +1,4 @@
-# Google Analytics MCP Server (Experimental)
+# Google Analytics MCP Server
 
 [![PyPI version](https://img.shields.io/pypi/v/analytics-mcp.svg)](https://pypi.org/project/analytics-mcp/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -8,7 +8,7 @@
 [![GitHub forks](https://img.shields.io/github/forks/googleanalytics/google-analytics-mcp?style=social)](https://github.com/googleanalytics/google-analytics-mcp/network/members)
 [![YouTube Video Views](https://img.shields.io/youtube/views/PT4wGPxWiRQ)](https://www.youtube.com/watch?v=PT4wGPxWiRQ)
 
-This repo contains the source code for running a local
+This repo contains the source code for running a local or remote multi-tenant
 [MCP](https://modelcontextprotocol.io) server that interacts with APIs for
 [Google Analytics](https://support.google.com/analytics).
 
@@ -32,11 +32,24 @@ to provide several
 - `get_property_details`: Returns details about a property.
 - `list_google_ads_links`: Returns a list of links to Google Ads accounts for
   a property.
+- `list_property_annotations`: Returns annotations for a property.
+- `create_property_annotation`: Creates an annotation for a property (requires
+  passing the `--allow-write` flag and the `analytics.edit` scope).
+- `list_key_events`: Returns the key events (formerly conversions) defined on a
+  property.
+- `create_custom_dimension`: Creates a custom dimension on a property (requires
+  passing the `--allow-write` flag and the `analytics.edit` scope, and the
+  Editor role on the property).
+- `create_key_event`: Marks an event as a key event on a property (requires
+  passing the `--allow-write` flag and the `analytics.edit` scope, and the
+  Marketer or Editor role on the property).
 
 ### Run core reports 📙
 
 - `run_report`: Runs a Google Analytics report using the Data API.
 - `run_funnel_report`: Runs a Google Analytics funnel report using the Data API.
+- `run_conversions_report`: Runs a Google Analytics conversions report
+  (ad costs, conversions, ROAS and attribution models) using the Data API.
 - `get_custom_dimensions_and_metrics`: Retrieves the custom dimensions and
   metrics for a specific property.
 
@@ -73,63 +86,241 @@ to enable the following APIs in your Google Cloud project:
 
 ### Configure credentials 🔑
 
-This fork authenticates each user with their **personal Google account** via
-OAuth 2.0. It runs as a remote streamable-HTTP server; the MCP connector walks
-the user through Google's consent screen, and every tool call runs with that
-user's Google Analytics permissions. The account must already have access to
-the GA4 properties it should read.
+Configure your [Application Default Credentials
+(ADC)](https://cloud.google.com/docs/authentication/provide-credentials-adc).
+Make sure the credentials are for a user with access to your Google Analytics
+accounts or properties.
 
-1.  In your Google Cloud project, create an **OAuth 2.0 Client ID** of type
-    *Web application* (APIs & Services > Credentials). See
-    [Manage OAuth Clients](https://support.google.com/cloud/answer/15549257).
+Credentials must include the Google Analytics read-only scope:
 
-1.  Add the following **Authorized redirect URI**, where `BASE_URL` is the
-    public HTTPS URL of your deployment:
+```
+https://www.googleapis.com/auth/analytics.readonly
+```
 
+If you plan to enable write tools (such as `create_property_annotation`,
+`create_custom_dimension` or `create_key_event`) using the `--allow-write` flag,
+your credentials must also include the edit scope:
+
+```
+https://www.googleapis.com/auth/analytics.edit
+```
+
+When using Application Default Credentials, add this scope to the `--scopes`
+value of the `gcloud` commands below and re-run the login.
+
+Check out
+[Manage OAuth Clients](https://support.google.com/cloud/answer/15549257)
+for how to create an OAuth client.
+
+Here are some sample `gcloud` commands you might find useful:
+
+- Set up ADC using user credentials and an OAuth desktop or web client after
+  downloading the client JSON to `YOUR_CLIENT_JSON_FILE`.
+
+  ```shell
+  gcloud auth application-default login \
+    --scopes https://www.googleapis.com/auth/analytics.readonly,https://www.googleapis.com/auth/cloud-platform \
+    --client-id-file=YOUR_CLIENT_JSON_FILE
+  ```
+
+- Set up ADC using service account impersonation.
+
+  ```shell
+  gcloud auth application-default login \
+    --impersonate-service-account=SERVICE_ACCOUNT_EMAIL \
+    --scopes=https://www.googleapis.com/auth/analytics.readonly,https://www.googleapis.com/auth/cloud-platform
+  ```
+
+When the `gcloud auth application-default` command completes, copy the
+`PATH_TO_CREDENTIALS_JSON` file location printed to the console in the
+following message. You'll need this for the next step!
+
+```
+Credentials saved to file: [PATH_TO_CREDENTIALS_JSON]
+```
+
+### Configure Gemini
+
+1.  Install [Gemini
+    CLI](https://github.com/google-gemini/gemini-cli/blob/main/docs/get-started/installation.md)
+    or [Gemini Code
+    Assist](https://marketplace.visualstudio.com/items?itemName=Google.geminicodeassist).
+
+1.  Create or edit the file at `~/.gemini/settings.json`, adding your server
+    to the `mcpServers` list.
+
+    Replace `PATH_TO_CREDENTIALS_JSON` with the path you copied in the previous
+    step.
+
+    We also recommend that you add a `GOOGLE_CLOUD_PROJECT` attribute to the
+    `env` object. Replace `YOUR_PROJECT_ID` in the following example with the
+    [project ID](https://support.google.com/googleapi/answer/7014113) of your
+    Google Cloud project.
+
+    ```json
+    {
+      "mcpServers": {
+        "analytics-mcp": {
+          "command": "pipx",
+          "args": ["run", "analytics-mcp"],
+          "env": {
+            "GOOGLE_APPLICATION_CREDENTIALS": "PATH_TO_CREDENTIALS_JSON",
+            "GOOGLE_CLOUD_PROJECT": "YOUR_PROJECT_ID"
+          }
+        }
+      }
+    }
     ```
-    <BASE_URL>/auth/callback
+
+    To enable write tools (e.g. `create_property_annotation`), append
+    `"--allow-write"` to `"args"`: `["run", "analytics-mcp", "--allow-write"]`.
+
+### Configure Claude Code
+
+1.  Add the MCP server with the following command:
+
+    Replace `PATH_TO_CREDENTIALS_JSON` with the path you copied in the previous
+    step, and replace `YOUR_PROJECT_ID` with the
+    [project ID](https://support.google.com/googleapi/answer/7014113) of your
+    Google Cloud project.
+
+    ```shell
+    claude mcp add analytics-mcp \
+      --scope user \
+      -e "GOOGLE_APPLICATION_CREDENTIALS=PATH_TO_CREDENTIALS_JSON" \
+      -e "GOOGLE_CLOUD_PROJECT=YOUR_PROJECT_ID" \
+      -- pipx run analytics-mcp
     ```
 
-1.  Configure the server via environment variables (see
-    [`.env.example`](./.env.example)):
+## Multi-tenant HTTP & End-User OAuth 🌐
 
-    | Variable | Description |
-    | --- | --- |
-    | `ANALYTICS_MCP_OAUTH_CLIENT_ID` | OAuth 2.0 client ID |
-    | `ANALYTICS_MCP_OAUTH_CLIENT_SECRET` | OAuth 2.0 client secret |
-    | `ANALYTICS_MCP_BASE_URL` | Public HTTPS base URL, e.g. `https://ga4-mcp.example.com` |
-
-    The requested scopes are `openid`, `userinfo.email`, `userinfo.profile`,
-    and `https://www.googleapis.com/auth/analytics.readonly`.
-
-When both OAuth client variables are set, `analytics-mcp` serves streamable
-HTTP at `/mcp`. With them unset it falls back to stdio (for local development),
-but tool calls then have no user token and will fail — OAuth is the supported
-path for this fork.
-
-### Deploy with Docker 🐳
+To host `analytics-mcp` as a shared multi-tenant HTTP service (where each end
+user signs in with their own Google account via OAuth 2.0 rather than using
+server-side Application Default Credentials), start the server with
+`--transport http`:
 
 ```shell
-docker build -t analytics-mcp .
-docker run -p 8000:8000 --env-file .env analytics-mcp
+pipx run analytics-mcp \
+  --transport http --stateless-http --host 0.0.0.0 --port 8080
 ```
 
-### Connect an MCP client
+- **Agent Framework OAuth (e.g. Google ADK)**: Configure per-user Google OAuth
+  on `McpToolset` so end users are automatically prompted with a **Sign in**
+  button in the chat UI, and can even combine Google Analytics MCP alongside
+  other MCP servers in the same agent. Paired with `--stateless-http`, this
+  mode is completely stateless and horizontally scalable across multiple
+  replicas.
+- **Native MCP OAuth 2.1 Server (`--oauth`)**: Pass `--oauth` or set
+  `ANALYTICS_MCP_OAUTH=true` (with `GOOGLE_OAUTH_CLIENT_ID`,
+  `GOOGLE_OAUTH_CLIENT_SECRET`, and optional `ANALYTICS_MCP_ISSUER_URL`) to
+  enable the built-in MCP OAuth 2.1 Authorization Server:
 
-Point your client at the deployed endpoint and let it run the OAuth flow:
+  ```shell
+  export GOOGLE_OAUTH_CLIENT_ID="your-client-id.apps.googleusercontent.com"
+  export GOOGLE_OAUTH_CLIENT_SECRET="your-client-secret"
+  export ANALYTICS_MCP_ISSUER_URL="https://analytics-mcp.yourdomain.com"
 
-```
-https://ga4-mcp.example.com/mcp
-```
+  pipx run analytics-mcp \
+    --transport http --stateless-http --oauth --host 0.0.0.0 --port 8080
+  ```
 
-For example, in Claude Code:
+  Note: The built-in `--oauth` provider stores dynamic client registrations,
+  pending authorization state, and refresh tokens in process memory (run as a
+  single instance or with sticky sessions; restarts require re-authentication).
 
-```shell
-claude mcp add analytics-mcp \
-  --scope user \
-  --transport http \
-  https://ga4-mcp.example.com/mcp
-```
+### Deploy with Docker & Google Cloud Run 🐳
+
+The repository includes a root [`Dockerfile`](Dockerfile) that runs
+`analytics-mcp` in stateless HTTP mode on `$PORT` (default `8080`) as a
+non-root user. Server flags can be configured entirely through environment
+variables:
+
+| Environment Variable | CLI Option | Default | Description |
+| --- | --- | --- | --- |
+| `PORT` | `--port` | `8000` (`8080` in `Dockerfile`) | Port to bind when `--transport http`. |
+| `ANALYTICS_MCP_STATELESS_HTTP` | `--stateless-http` | `false` (`true` in `Dockerfile`) | Handle each HTTP request independently without in-memory session state. |
+| `ANALYTICS_MCP_ALLOW_WRITE` | `--allow-write` | `false` | Enable tools that create or modify Google Analytics resources. |
+| `ANALYTICS_MCP_OAUTH` | `--oauth` | `false` | Enable the built-in MCP OAuth 2.1 Authorization Server. |
+| `ANALYTICS_MCP_ISSUER_URL` | `--issuer-url` | `http://<host>:<port>` | Public HTTPS base URL of the service when OAuth is enabled. |
+| `GOOGLE_OAUTH_CLIENT_ID` | — | — | Google OAuth 2.0 Web Client ID (required when OAuth is enabled). |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | — | — | Google OAuth 2.0 Web Client Secret (inject via Secret Manager in production). |
+
+- **Stateless HTTP mode on Cloud Run** (for upstream agents like Google ADK that
+  forward per-user Bearer tokens):
+
+  ```shell
+  gcloud run deploy analytics-mcp \
+    --source . \
+    --region us-central1 \
+    --allow-unauthenticated
+  ```
+
+  Note that `--allow-unauthenticated` exposes the public HTTPS endpoint at the
+  Cloud Run layer, while `analytics-mcp` itself strictly requires a Google OAuth
+  Bearer token on every tool request.
+
+- **Native MCP OAuth 2.1 mode on Cloud Run** (storing the client secret in
+  Google Cloud Secret Manager so it is injected as an environment variable at
+  runtime rather than stored in files or source control):
+
+  ```shell
+  # 1. Store your Google OAuth Client Secret in Secret Manager once
+  printf "%s" "YOUR_CLIENT_SECRET" | \
+    gcloud secrets create analytics-mcp-oauth-secret --data-file=-
+
+  # 2. Deploy to Cloud Run (--max-instances=1 keeps in-memory OAuth state consistent)
+  gcloud run deploy analytics-mcp \
+    --source . \
+    --region us-central1 \
+    --allow-unauthenticated \
+    --max-instances 1 \
+    --set-env-vars "ANALYTICS_MCP_OAUTH=true,GOOGLE_OAUTH_CLIENT_ID=YOUR_CLIENT_ID.apps.googleusercontent.com" \
+    --set-secrets "GOOGLE_OAUTH_CLIENT_SECRET=analytics-mcp-oauth-secret:latest"
+
+  # 3. Set ANALYTICS_MCP_ISSUER_URL to the deployed Cloud Run URL and add
+  #    <SERVICE_URL>/oauth/callback to Authorized redirect URIs in Cloud Console
+  SERVICE_URL=$(gcloud run services describe analytics-mcp --region us-central1 --format="value(status.url)")
+  gcloud run services update analytics-mcp \
+    --region us-central1 \
+    --update-env-vars "ANALYTICS_MCP_ISSUER_URL=${SERVICE_URL}"
+  ```
+
+- **Local Docker**:
+
+  ```shell
+  docker build -t analytics-mcp .
+  docker run --rm -p 8080:8080 \
+    -e ANALYTICS_MCP_OAUTH=true \
+    -e GOOGLE_OAUTH_CLIENT_ID="your-client-id.apps.googleusercontent.com" \
+    -e GOOGLE_OAUTH_CLIENT_SECRET="your-client-secret" \
+    analytics-mcp
+  ```
+
+See the complete multi-tenant walkthrough and runnable ADK agent code in
+[`examples/multi_tenant_adk_agent/README.md`](examples/multi_tenant_adk_agent/README.md).
+
+### Touchpoint deployment (Dokploy) 🚀
+
+This fork runs the upstream image with the built-in OAuth 2.1 server, so every
+user signs in with their personal Google account, and adds a usage log of every
+tool call. Configure it through environment variables:
+
+| Variable | Value |
+| --- | --- |
+| `ANALYTICS_MCP_OAUTH` | `true` |
+| `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | Web OAuth client of the Google Cloud project |
+| `ANALYTICS_MCP_ISSUER_URL` | Public HTTPS URL behind Traefik, e.g. `https://ga4-mcp.touchpoint.agency` |
+| `ANALYTICS_MCP_USAGE_LOG` | `true`: records every tool call to the `tool_call` table |
+| `MCP_USAGE_DSN` | Postgres DSN of the `mcp_usage` database, with `sslmode=require` |
+| `PORT` | `8000` (the image defaults to `8080`) |
+
+Register `<ANALYTICS_MCP_ISSUER_URL>/oauth/callback` as authorized redirect URI
+of the OAuth client. Besides the Analytics scope, the consent screen asks for
+`openid` and `userinfo.email`, which the usage log needs to attribute a call to
+a user. With `--usage-log` enabled and `MCP_USAGE_DSN` missing, the server
+refuses to start.
+
+See [`.env.example`](./.env.example) for the complete set of variables.
 
 ## Try it out 🥼
 
@@ -168,6 +359,16 @@ Here are some sample prompts to get you started:
   what are the custom dimensions and custom metrics in my property?
   ```
 
+- Create a custom dimension (requires the `--allow-write` flag):
+
+  ```
+  Create an event-scoped custom dimension for the plan_tier parameter in property 12345
+  ```
+
 ## Contributing ✨
 
 Contributions welcome! See the [Contributing Guide](CONTRIBUTING.md).
+
+## Troubleshooting
+
+See the [Troubleshooting Guide](TROUBLESHOOTING.md) for common issues and workarounds.

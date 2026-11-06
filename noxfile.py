@@ -23,18 +23,16 @@ TEST_COMMAND = [
     "run",
     "--append",
     "-m",
-    "unittest",
-    "discover",
-    "--buffer",
-    "-s=tests",
-    "-p",
-    "*_test.py",
+    "pytest",
+    "tests",
 ]
 
 FREEZE_COMMAND = ["python", "-m", "pip", "freeze"]
 TEST_DEPENDENCIES = [
     "pyfakefs>=5.0.0,<6.0",
     "coverage==6.5.0",
+    "pytest>=8,<10",
+    "pytest-asyncio>=1,<2",
 ]
 
 
@@ -84,4 +82,32 @@ def tests(session):
     session.run(*FREEZE_COMMAND)
     session.run(
         *TEST_COMMAND,
+    )
+
+
+@nox.session(python="3.12")
+def compile_kokoro_requirements(session):
+    """Recompiles .kokoro/requirements.txt.
+
+    NOTE: Forking Renovate automatically manages routine updates to this file.
+    Only run this session for manual overrides (e.g. urgent security patches).
+    """
+    custom_command = (
+        "nox -s compile_kokoro_requirements\n"
+        "#\n"
+        "# Note: Forking Renovate automatically manages routine updates to this file.\n"
+        "# Only run the command above for rare manual overrides (e.g. urgent security patches)."
+    )
+
+    session.install("pip-tools")
+    session.run(
+        "pip-compile",
+        "--upgrade",
+        "--verbose",
+        "--generate-hashes",
+        "--no-emit-index-url",
+        "--no-emit-trusted-host",
+        "--output-file=.kokoro/requirements.txt",
+        ".kokoro/requirements.in",
+        env={"CUSTOM_COMPILE_COMMAND": custom_command},
     )
